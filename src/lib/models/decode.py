@@ -494,14 +494,22 @@ def ctdet_decode(heat, wh, reg=None, cat_spec_wh=False, K=100):
       
     return detections
 
+"""
+heat: heat\in R^{[b,w,h]},\forall \hat{heat}\in heat, \hat{heat} \in [0.0, 1.0],热力图，代表该cell存在obj中心点的概率
+wh: wh\in R^{[b,w,h,2]},\forall \hat{wh}\in wh, \hat{wh} \in (-\infty, +\infty),wh的大小
+kps：在目标中心点位置上描述了J个关键点的偏移，[b,w,h,J,2]
+reg: reg\in R^{[b,w,h,2]},\forall \hat{reg} \in reg, \hat{reg} \in (-0.5, +0.5),obj中心点的x，y偏移
+hm_hp: hm_hp\in R^{[b,w,h,J]},\forall \hat{hm_hp} \in hm_hp, \hat{hm_hp} \in [0.0, 1.0],热力图，代表该cell存在key point的概率
+hp_offset: hp_offset\in R^{[b,w,h,J,2]},\forall \hat{hp_offset} \in hp_offset, \hat{hp_offset} \in [-0.5, 0.5],key point的x，y偏移
+"""
 def multi_pose_decode(
     heat, wh, kps, reg=None, hm_hp=None, hp_offset=None, K=100):
   batch, cat, height, width = heat.size()
   num_joints = kps.shape[1] // 2
   # heat = torch.sigmoid(heat)
   # perform nms on heatmaps
-  heat = _nms(heat)
-  scores, inds, clses, ys, xs = _topk(heat, K=K)
+  heat = _nms(heat) # 进行一定区域的非极大值抑制
+  scores, inds, clses, ys, xs = _topk(heat, K=K) # 获取前排K个目标，生成
 
   kps = _transpose_and_gather_feat(kps, inds)
   kps = kps.view(batch, K, num_joints * 2)
@@ -524,12 +532,17 @@ def multi_pose_decode(
                       ys - wh[..., 1:2] / 2,
                       xs + wh[..., 0:1] / 2, 
                       ys + wh[..., 1:2] / 2], dim=2)
+  # 通过kps已经可以获取粗略的keypoint位置，如果没有hp数据{hm_hp,hp_offset}，就直接使用kps作为keypoint
+  # 如果存在hp数据，则可以通过hp数据进行更加精细的keypoint定位
+  # kps可以直接提供实例+keypoint location
+  # hp数据可以提供更加精细的keypoint location
+  # 通过kps与hp数据的keypoint set计算最小距离进行绑定，从而选择keypoint location
   if hm_hp is not None:
-      hm_hp = _nms(hm_hp)
+      hm_hp = _nms(hm_hp)   # 进行一定区域的非极大值抑制
       thresh = 0.1
       kps = kps.view(batch, K, num_joints, 2).permute(
           0, 2, 1, 3).contiguous() # b x J x K x 2
-      reg_kps = kps.unsqueeze(3).expand(batch, num_joints, K, K, 2)
+      reg_kps = kps.unsqueeze(3).expand(batch, num_joints, K, K, 2) # [b,J,K,2]->[b,J,K,1,2]->[b,J,K,\hat{K},2]
       hm_score, hm_inds, hm_ys, hm_xs = _topk_channel(hm_hp, K=K) # b x J x K
       if hp_offset is not None:
           hp_offset = _transpose_and_gather_feat(
@@ -543,14 +556,14 @@ def multi_pose_decode(
         
       mask = (hm_score > thresh).float()
       hm_score = (1 - mask) * -1 + mask * hm_score
-      hm_ys = (1 - mask) * (-10000) + mask * hm_ys
+      hm_ys = (1 - mask) * (-10000) + mask * hm_ys  # 这一步看起来很迷惑，其实就是为了让hm_score<thresh的那一部分放远一点，让后续通过距离最小匹配对应点的时候不会用到这一部分点
       hm_xs = (1 - mask) * (-10000) + mask * hm_xs
       hm_kps = torch.stack([hm_xs, hm_ys], dim=-1).unsqueeze(
-          2).expand(batch, num_joints, K, K, 2)
-      dist = (((reg_kps - hm_kps) ** 2).sum(dim=4) ** 0.5)
-      min_dist, min_ind = dist.min(dim=3) # b x J x K
+          2).expand(batch, num_joints, K, K, 2) # [b,J,K]->[b,J,K,2]->[b,J,1,K,2]->[b,J,\hat{k},K,2]
+      dist = (((reg_kps - hm_kps) ** 2).sum(dim=4) ** 0.5)  # 遍历获取距离
+      min_dist, min_ind = dist.min(dim=3) # b x J x K   # 获得的是：reg_kps中的点对应第几个hm_kps中的点距离最小
       hm_score = hm_score.gather(2, min_ind).unsqueeze(-1) # b x J x K x 1
-      min_dist = min_dist.unsqueeze(-1)
+      min_dist = min_dist.unsqueeze(-1) # [b,J,K,1]
       min_ind = min_ind.view(batch, num_joints, K, 1, 1).expand(
           batch, num_joints, K, 1, 2)
       hm_kps = hm_kps.gather(3, min_ind)
@@ -563,7 +576,7 @@ def multi_pose_decode(
              (hm_kps[..., 1:2] < t) + (hm_kps[..., 1:2] > b) + \
              (hm_score < thresh) + (min_dist > (torch.max(b - t, r - l) * 0.3))
       mask = (mask > 0).float().expand(batch, num_joints, K, 2)
-      kps = (1 - mask) * hm_kps + mask * kps
+      kps = (1 - mask) * hm_kps + mask * kps    # keypoint的两情况，作者认为hp方面对keypoint的精度比较高，当有序对{hm_hp，kps}最小距离元素对应的hp点在框内
       kps = kps.permute(0, 2, 1, 3).contiguous().view(
           batch, K, num_joints * 2)
   detections = torch.cat([bboxes, scores, kps, clses], dim=2)
